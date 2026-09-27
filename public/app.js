@@ -18,8 +18,11 @@
  *  8. 控件名称审计：展示组合树内 button / a[href] / input[type=text]
  *     的可访问名称、名称来源与缺名 / 歧义原因（含 aria-labelledby
  *     缺失 / 重复引用诊断），点击条目联动预览高亮；
- *  9. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计、
- *     控件名称审计）经 POST /api/export 导出为 JSON 附件。
+ *  9. 焦点裁剪审计：展示 Tab 顺序节点被 iframe 视口与组合祖先 overflow
+ *     裁剪的状态（完整 / 部分裁剪 / 完全裁剪 / 无法判定）、剩余面积比例
+ *     与实际缩小区域的祖先，点击条目联动预览高亮；
+ * 10. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计、
+ *     控件名称审计、焦点裁剪审计）经 POST /api/export 导出为 JSON 附件。
  */
 (function () {
   'use strict';
@@ -86,7 +89,13 @@
     nameCount: document.getElementById('name-count'),
     nameMeta: document.getElementById('name-meta'),
     nameList: document.getElementById('name-list'),
-    nameHint: document.getElementById('name-hint')
+    nameHint: document.getElementById('name-hint'),
+    tabClip: document.getElementById('tab-clip'),
+    clipPanel: document.getElementById('clip-panel'),
+    clipCount: document.getElementById('clip-count'),
+    clipMeta: document.getElementById('clip-meta'),
+    clipList: document.getElementById('clip-list'),
+    clipHint: document.getElementById('clip-hint')
   };
 
   var state = {
@@ -103,7 +112,8 @@
     modalAudit: null,    // 最近一次模态焦点陷阱审计结果
     visualAudit: null,   // 最近一次视觉顺序审计结果
     nameAudit: null,     // 最近一次控件名称审计结果
-    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual' / 'name'），用于定位高亮失败提示
+    focusClipAudit: null, // 最近一次焦点裁剪审计结果
+    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual' / 'name' / 'clip'），用于定位高亮失败提示
   };
 
   /* ---------------- 示例输入 ---------------- */
@@ -167,6 +177,12 @@
     '</fieldset>',
     '<a>没有 href 的链接（不可聚焦）</a>',
     '<div aria-hidden="true"><button>aria-hidden 内的可聚焦按钮</button></div>',
+    '<!-- 焦点裁剪审计：overflow 容器把内部按钮裁成部分可见 / 完全不可见 -->',
+    '<div class="clip-demo">',
+    '  <button>裁剪容器内按钮 1</button>',
+    '  <button>裁剪容器内按钮 2</button>',
+    '  <button>裁剪容器内按钮 3</button>',
+    '</div>',
     '<!-- 控件名称审计：原生 label / aria-labelledby（多引用拼接，含隐藏节点）/ aria-label -->',
     '<label for="nick">昵称</label>',
     '<input id="nick" type="text">',
@@ -187,6 +203,7 @@
     'button, a, input, summary, div[tabindex] { display: inline-block; margin: 4px; padding: 4px 8px; }',
     'x-card, x-secret, x-delegate { display: block; }',
     '.gone { display: none; }',
+    '.clip-demo { width: 180px; height: 48px; overflow: auto; border: 1px solid #999; white-space: nowrap; margin: 8px 0; }',
     '.demo-modal { display: block; margin: 8px 0; padding: 10px; border: 2px solid #4f8cff; border-radius: 6px; background: #eef4ff; }',
     ':focus { outline: 2px dashed #4f8cff; }'
   ].join('\n');
@@ -348,6 +365,7 @@
       if (state.highlightOrigin === 'modal') setModalHint(missText);
       else if (state.highlightOrigin === 'visual') setVisualHint(missText);
       else if (state.highlightOrigin === 'name') setNameHint(missText);
+      else if (state.highlightOrigin === 'clip') setClipHint(missText);
       else setDiffHint(missText);
       state.highlightOrigin = null;
     } else if (d.type === 'error') {
@@ -363,6 +381,7 @@
     state.modalAudit = payload.modalAudit || null;
     state.visualAudit = payload.visualAudit || null;
     state.nameAudit = payload.nameAudit || null;
+    state.focusClipAudit = payload.focusClipAudit || null;
     state.stats = payload.stats || null;
     state.currentStep = -1;
     renderResults();
@@ -582,6 +601,7 @@
     renderModalAudit();
     renderVisualAudit();
     renderNameAudit();
+    renderClipAudit();
   }
 
   /* ---------------- 模态焦点陷阱审计 ---------------- */
@@ -1083,6 +1103,119 @@
     });
   }
 
+  /* ---------------- 焦点裁剪审计 ---------------- */
+
+  var CLIP_STATUS_META = {
+    'full': { label: '完整', cls: 'clip-full' },
+    'partial': { label: '部分裁剪', cls: 'clip-partial' },
+    'clipped': { label: '完全裁剪', cls: 'clip-clipped' },
+    'undetermined': { label: '无法判定', cls: 'clip-undetermined' }
+  };
+
+  function setClipHint(text) {
+    els.clipHint.textContent = text || '';
+  }
+
+  function clearClipActive() {
+    var all = els.clipPanel.querySelectorAll('.diff-item.active');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  }
+
+  /** 裁剪来源描述：iframe 视口 / 祖先标签 + 实际裁剪的轴 */
+  function clipSourceText(c) {
+    var axes = (c.axes || []).map(function (a) { return a === 'x' ? 'x 轴' : 'y 轴'; }).join('、');
+    return (c.kind === 'viewport' ? 'iframe 视口' : c.label) + '（裁 ' + axes + '）';
+  }
+
+  function renderClipAudit() {
+    var audit = state.focusClipAudit;
+    els.clipList.innerHTML = '';
+    els.clipMeta.textContent = '';
+    setClipHint('');
+
+    if (!audit) {
+      els.clipCount.textContent = '0';
+      var tip0 = document.createElement('li');
+      tip0.className = 'empty-tip';
+      tip0.textContent = '尚无审计结果。';
+      els.clipList.appendChild(tip0);
+      return;
+    }
+
+    var items = audit.items || [];
+    var st = audit.stats || {};
+    // 角标计数 = 部分裁剪数 + 完全裁剪数 + 无法判定数
+    els.clipCount.textContent = String((st.partial || 0) + (st.clipped || 0) + (st.undetermined || 0));
+    var vp = audit.viewport || {};
+    els.clipMeta.textContent =
+      'iframe 视口 ' + (vp.width || 0) + '×' + (vp.height || 0) +
+      ' · 共 ' + (st.total || 0) + ' 个 Tab 节点：完整 ' + (st.full || 0) +
+      ' · 部分裁剪 ' + (st.partial || 0) + ' · 完全裁剪 ' + (st.clipped || 0) +
+      ' · 无法判定 ' + (st.undetermined || 0) +
+      '（以重算时布局为准，仅判矩形裁剪，不检测其他元素遮挡）';
+
+    if (items.length === 0) {
+      var tip = document.createElement('li');
+      tip.className = 'empty-tip';
+      tip.textContent = '当前没有可 Tab 聚焦的节点，无需焦点裁剪审计。';
+      els.clipList.appendChild(tip);
+      return;
+    }
+
+    items.forEach(function (it) {
+      var meta = CLIP_STATUS_META[it.status] || { label: it.status, cls: '' };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item ' + meta.cls;
+
+      var line = document.createElement('span');
+      var no = document.createElement('span');
+      no.className = 'step-no';
+      no.textContent = String(it.step);
+      line.appendChild(no);
+      line.appendChild(document.createTextNode(' ' + (it.label || '')));
+      var badge = document.createElement('span');
+      badge.className = 'type-badge ' + meta.cls;
+      badge.textContent = meta.label;
+      line.appendChild(badge);
+      if (it.status === 'partial') {
+        var bp = document.createElement('span');
+        bp.className = 'badge clip-percent';
+        bp.textContent = '剩余 ' + it.visiblePercent + '%';
+        line.appendChild(bp);
+      }
+      btn.appendChild(line);
+
+      var detail = document.createElement('span');
+      detail.className = 'diff-detail';
+      var parts = [it.message];
+      if (it.clippers && it.clippers.length > 0) {
+        parts.push('实际缩小区域：' + it.clippers.map(clipSourceText).join(' → '));
+      }
+      detail.textContent = parts.join('；');
+      btn.appendChild(detail);
+
+      if (it.selector) {
+        var sel = document.createElement('span');
+        sel.className = 'sel';
+        sel.textContent = it.selector;
+        btn.appendChild(sel);
+      }
+
+      // 点击联动预览高亮：条目均在 Tab 顺序中，复用分段选择器步进高亮
+      btn.addEventListener('click', function () {
+        clearClipActive();
+        btn.classList.add('active');
+        setClipHint('');
+        state.highlightOrigin = 'clip';
+        sendToFrame({ type: 'highlight', step: it.step - 1 });
+      });
+      li.appendChild(btn);
+      els.clipList.appendChild(li);
+    });
+  }
+
   /* ---------------- 基线对比 ---------------- */
 
   var DIFF_TYPE_META = {
@@ -1383,6 +1516,14 @@
         items: state.nameAudit.items,
         stats: state.nameAudit.stats
       } : null,
+      // 焦点裁剪审计：iframe 视口矩形 / 逐 Tab 节点裁剪状态（完整 / 部分裁剪 /
+      // 完全裁剪 / 无法判定）、剩余面积比例、实际缩小区域的裁剪来源（视口 /
+      // 组合祖先，含轴向与 client 盒矩形）与无法判定原因
+      focusClipAudit: state.focusClipAudit ? {
+        viewport: state.focusClipAudit.viewport,
+        items: state.focusClipAudit.items,
+        stats: state.focusClipAudit.stats
+      } : null,
       // 基线对比：基线摘要 + 匹配结果 + 差异（未钉基线时为 null）
       baselineComparison: state.diff ? {
         baseline: state.diff.baseline,
@@ -1426,6 +1567,7 @@
       excluded: [els.tabExcluded, els.excludedPanel],
       modal: [els.tabModal, els.modalPanel],
       visual: [els.tabVisual, els.visualPanel],
+      clip: [els.tabClip, els.clipPanel],
       name: [els.tabName, els.namePanel],
       baseline: [els.tabBaseline, els.baselinePanel]
     };
@@ -1440,6 +1582,7 @@
   els.tabExcluded.addEventListener('click', function () { switchTab('excluded'); });
   els.tabModal.addEventListener('click', function () { switchTab('modal'); });
   els.tabVisual.addEventListener('click', function () { switchTab('visual'); });
+  els.tabClip.addEventListener('click', function () { switchTab('clip'); });
   els.tabName.addEventListener('click', function () { switchTab('name'); });
   els.tabBaseline.addEventListener('click', function () { switchTab('baseline'); });
 
@@ -1454,6 +1597,7 @@
   renderBaselinePanel();
   renderVisualAudit();
   renderNameAudit();
+  renderClipAudit();
 
   fetch('/analyzer.js')
     .then(function (res) {

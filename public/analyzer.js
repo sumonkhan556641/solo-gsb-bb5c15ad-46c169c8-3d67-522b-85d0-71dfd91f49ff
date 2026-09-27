@@ -23,12 +23,20 @@
  *     → 内容（按钮/链接）→ title，取首个非空结果，折叠空白）；id 引用与
  *     label 关联仅在控件所属 Document / ShadowRoot 内解析，文本沿 open
  *     Shadow DOM 与 slot 组合树读取；
- *  7. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
+ *  7. 焦点裁剪审计：以重算时的布局为准（不自动滚动），把 Tab 顺序节点的
+ *     边界矩形依次与 iframe 视口及全部组合祖先（沿 slot、open ShadowRoot
+ *     宿主上溯）的裁剪区域求交——祖先 overflow-x/y 计算值为
+ *     hidden / clip / auto / scroll 时仅裁对应轴，区域取扣除边框和滚动条
+ *     的 client 盒；按剩余面积占原面积比例区分完整 / 部分裁剪 / 完全裁剪，
+ *     并列出实际缩小区域的祖先；零面积，或节点及祖先存在 absolute/fixed
+ *     定位、非 none 的 transform / clip-path 时标为无法判定。
+ *     本轮只判矩形裁剪，不检测其他元素遮挡；
+ *  8. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
  *
  * 文件顶部的纯函数（parseTabIndexValue / computeOrder / buildDiagnostics /
  * pickActiveModal / computeModalCycle / buildModalDiagnostics /
  * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder /
- * collapseWs / parseIdList / pickNameSource）
+ * collapseWs / parseIdList / pickNameSource / auditFocusClip）
  * 不依赖 DOM，会在 Node 环境下导出，供单元测试使用。
  */
 (function () {
@@ -581,6 +589,171 @@
     };
   }
 
+  /* ---------------- 焦点裁剪审计（纯函数） ---------------- */
+
+  /** 面积比较容差：小于该值的面积视为零（吸收浮点误差） */
+  var CLIP_AREA_EPS = 1e-4;
+
+  /** 矩形面积 */
+  function rectArea(r) {
+    return r.width * r.height;
+  }
+
+  /**
+   * 轴对齐矩形求交：clip 仅裁 axes 中列出的轴（'x' / 'y'），其余轴保持原区间。
+   * @param {{left:number, top:number, width:number, height:number}} rect 当前剩余区域
+   * @param {{left:number, top:number, width:number, height:number}} clip 裁剪区域
+   * @param {string[]} axes 该裁剪区域实际作用的轴
+   */
+  function clipRectByAxes(rect, clip, axes) {
+    var out = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    var c = clip || {};
+    var cLeft = Number(c.left) || 0;
+    var cTop = Number(c.top) || 0;
+    var cWidth = Number(c.width) || 0;
+    var cHeight = Number(c.height) || 0;
+    if (axes && axes.indexOf('x') >= 0) {
+      var left = Math.max(out.left, cLeft);
+      var right = Math.min(out.left + out.width, cLeft + cWidth);
+      out.left = left;
+      out.width = Math.max(0, right - left);
+    }
+    if (axes && axes.indexOf('y') >= 0) {
+      var top = Math.max(out.top, cTop);
+      var bottom = Math.min(out.top + out.height, cTop + cHeight);
+      out.top = top;
+      out.height = Math.max(0, bottom - top);
+    }
+    return out;
+  }
+
+  /**
+   * 焦点裁剪审计（纯几何部分，不依赖 DOM）。
+   *
+   * @param {Array} nodes Tab 顺序中的节点（数组顺序即 Tab 顺序），每个为：
+   *   { step, selector, label,
+   *     rect:{left,top,width,height},   // 节点边界矩形（视口坐标）
+   *     blockReason:(object|null),      // DOM 侧预检的「无法判定」阻断因素：
+   *                                     //   { at:'self'|'ancestor', reason, label, selector, message }
+   *     clippers:Array }                // 组合祖先裁剪区域（内→外顺序）：
+   *                                     //   { kind:'ancestor', axes:['x'|'y'], label, selector, rect }
+   * @param {{viewport:{left:number, top:number, width:number, height:number}}} options
+   *   viewport 为 iframe 视口矩形（两轴裁剪，最先求交）。
+   *
+   * 判定规则：
+   *  1. 节点矩形零面积 → 无法判定（zero-area）；
+   *  2. 存在 blockReason（节点 / 祖先为 absolute|fixed 定位、非 none 的
+   *     transform / clip-path）→ 无法判定（reason 透传）；
+   *  3. 矩形依次与视口及各祖先裁剪区域求交（每个区域仅裁其 axes 列出的轴）；
+   *     仅记录「实际缩小区域」的裁剪来源（面积缩小超过容差）；
+   *  4. 按剩余面积占原面积比例分类：
+   *     full（完整，无实际缩小的裁剪来源）/ partial（部分裁剪，剩余面积 > 0）/
+   *     clipped（完全裁剪，剩余面积为 0）。
+   *
+   * @returns {{viewport:object, items:Array, stats:object}}
+   */
+  function auditFocusClip(nodes, options) {
+    var viewport = (options && options.viewport) || { left: 0, top: 0, width: 0, height: 0 };
+    var items = [];
+    var stats = { total: 0, full: 0, partial: 0, clipped: 0, undetermined: 0 };
+
+    (nodes || []).forEach(function (n) {
+      n = n || {};
+      var r = n.rect || {};
+      var rect = {
+        left: Number(r.left) || 0,
+        top: Number(r.top) || 0,
+        width: Number(r.width) || 0,
+        height: Number(r.height) || 0
+      };
+      var item = {
+        step: n.step === undefined ? null : n.step,
+        selector: n.selector || null,
+        label: n.label || null,
+        status: 'full',
+        reason: null,
+        rect: rect,
+        visibleRect: null,
+        visibleRatio: null,
+        visiblePercent: null,
+        clippers: [],
+        block: null,
+        message: ''
+      };
+      stats.total++;
+
+      // 1) 零面积：无法进行矩形裁剪判定（优先于阻断因素）
+      var area = rectArea(rect);
+      if (area <= CLIP_AREA_EPS) {
+        item.status = 'undetermined';
+        item.reason = 'zero-area';
+        item.message = '节点边界矩形宽或高为 0（零面积），无法进行矩形裁剪判定';
+        items.push(item);
+        stats.undetermined++;
+        return;
+      }
+
+      // 2) 阻断因素：定位 / transform / clip-path 使矩形求交不再成立
+      if (n.blockReason) {
+        item.status = 'undetermined';
+        item.reason = n.blockReason.reason || null;
+        item.block = n.blockReason;
+        item.message = n.blockReason.message || '';
+        items.push(item);
+        stats.undetermined++;
+        return;
+      }
+
+      // 3) 依次求交：先是 iframe 视口（两轴），再是组合祖先裁剪区域（内→外）
+      var visible = rect;
+      var clippers = [];
+      var regions = [{ kind: 'viewport', axes: ['x', 'y'], label: 'iframe 视口', selector: null, rect: viewport }]
+        .concat(n.clippers || []);
+      for (var i = 0; i < regions.length; i++) {
+        var c = regions[i] || {};
+        var before = rectArea(visible);
+        visible = clipRectByAxes(visible, c.rect, c.axes);
+        if (before - rectArea(visible) > CLIP_AREA_EPS) {
+          clippers.push({
+            kind: c.kind || 'ancestor',
+            axes: c.axes || [],
+            label: c.label || null,
+            selector: c.selector || null,
+            rect: c.rect || null
+          });
+        }
+      }
+
+      // 4) 分类：剩余面积占原面积的比例
+      var ratio = rectArea(visible) / area;
+      if (ratio > 1) ratio = 1; // 数值保险（求交不会放大区域）
+      item.visibleRect = {
+        left: Math.round(visible.left * 100) / 100,
+        top: Math.round(visible.top * 100) / 100,
+        width: Math.round(visible.width * 100) / 100,
+        height: Math.round(visible.height * 100) / 100
+      };
+      item.visibleRatio = Math.round(ratio * 10000) / 10000;
+      item.visiblePercent = Math.round(ratio * 1000) / 10;
+      item.clippers = clippers;
+
+      if (clippers.length === 0) {
+        item.status = 'full';
+        item.message = '节点完整可见：未被 iframe 视口或任何组合祖先裁剪';
+      } else if (rectArea(visible) <= CLIP_AREA_EPS) {
+        item.status = 'clipped';
+        item.message = '节点被完全裁剪：剩余可见面积为 0';
+      } else {
+        item.status = 'partial';
+        item.message = '节点被部分裁剪：剩余可见面积约占原面积的 ' + item.visiblePercent + '%';
+      }
+      stats[item.status]++;
+      items.push(item);
+    });
+
+    return { viewport: viewport, items: items, stats: stats };
+  }
+
   /* ---------------- 控件名称审计（纯函数部分） ---------------- */
 
   /** 折叠空白：连续空白（含换行 / 制表）压成单个空格，并去除首尾空白 */
@@ -623,6 +796,7 @@
         computeModalCycle: computeModalCycle,
         buildModalDiagnostics: buildModalDiagnostics,
         auditVisualOrder: auditVisualOrder,
+        auditFocusClip: auditFocusClip,
         collapseWs: collapseWs,
         parseIdList: parseIdList,
         pickNameSource: pickNameSource
@@ -1678,6 +1852,115 @@
     return result;
   }
 
+  /* ---------------- 焦点裁剪审计（DOM 采集） ---------------- */
+
+  /** overflow-x/y 计算值属于该集合时，祖先在对应轴上产生裁剪（区域取 client 盒） */
+  var CLIP_OVERFLOW = { hidden: true, clip: true, auto: true, scroll: true };
+
+  function round2(v) {
+    return Math.round(v * 100) / 100;
+  }
+
+  /**
+   * 沿组合祖先链（经 slot、open ShadowRoot 宿主上溯）一次性收集：
+   *  - 阻断因素：节点自身或任一组合祖先存在 absolute / fixed 定位、非 none 的
+   *    transform 或 clip-path（命中即停——矩形求交不再成立，无需再收集裁剪区域）；
+   *  - 裁剪区域：祖先 overflow-x / overflow-y 计算值为 hidden / clip / auto /
+   *    scroll 时仅裁对应轴，区域取扣除边框和滚动条的 client 盒
+   *    （border 盒左上 + clientLeft/clientTop，尺寸 clientWidth/clientHeight）。
+   * display:contents 不产生盒（其定位 / transform 不作用于后代），跳过。
+   * 返回 { blockReason, clippers }，clippers 为内→外顺序（不含视口）。
+   */
+  function focusClipChainInfo(el) {
+    var clippers = [];
+    var node = el;
+    var guard = 0;
+    while (node && node.nodeType === 1 && guard++ < 1000) {
+      var cs = getComputedStyle(node);
+      if (cs.display !== 'contents') {
+        var at = node === el ? 'self' : 'ancestor';
+        var blocked = null;
+        if (cs.position === 'absolute' || cs.position === 'fixed') {
+          blocked = { reason: 'positioned', message: ' 为 ' + cs.position + ' 定位，矩形裁剪关系无法判定' };
+        } else if (cs.transform && cs.transform !== 'none') {
+          blocked = { reason: 'transformed', message: ' 带有非 none 的 transform，矩形裁剪关系无法判定' };
+        } else if (cs.clipPath && cs.clipPath !== 'none') {
+          blocked = { reason: 'clip-path', message: ' 带有非 none 的 clip-path，矩形裁剪关系无法判定' };
+        }
+        if (blocked) {
+          var label = describe(node).css;
+          return {
+            blockReason: {
+              at: at,
+              reason: blocked.reason,
+              label: label,
+              selector: stableRoute(node),
+              message: (at === 'self' ? '节点自身' : '祖先 ' + label) + blocked.message
+            },
+            clippers: []
+          };
+        }
+        if (at === 'ancestor') {
+          var axes = [];
+          if (CLIP_OVERFLOW[cs.overflowX]) axes.push('x');
+          if (CLIP_OVERFLOW[cs.overflowY]) axes.push('y');
+          if (axes.length > 0) {
+            var br = node.getBoundingClientRect();
+            clippers.push({
+              kind: 'ancestor',
+              axes: axes,
+              label: describe(node).css,
+              selector: stableRoute(node),
+              rect: {
+                left: round2(br.left + node.clientLeft),
+                top: round2(br.top + node.clientTop),
+                width: round2(node.clientWidth),
+                height: round2(node.clientHeight)
+              }
+            });
+          }
+        }
+      }
+      node = composedParent(node);
+    }
+    return { blockReason: null, clippers: clippers };
+  }
+
+  /**
+   * 焦点裁剪审计：对 Tab 顺序中的每个节点采集边界矩形
+   * （getBoundingClientRect，视口坐标）、阻断因素与组合祖先裁剪区域，
+   * 运行纯函数 auditFocusClip 分类。只读取布局，不滚动页面
+   * （以重算时的布局为准）；本轮只判矩形裁剪，不检测其他元素遮挡。
+   */
+  function computeFocusClipAudit() {
+    var viewport = {
+      left: 0,
+      top: 0,
+      width: window.innerWidth || document.documentElement.clientWidth || 0,
+      height: window.innerHeight || document.documentElement.clientHeight || 0
+    };
+    var nodes = [];
+    for (var i = 0; i < order.length; i++) {
+      var e = entries[order[i]];
+      var r = e.el.getBoundingClientRect();
+      var chain = focusClipChainInfo(e.el);
+      nodes.push({
+        step: i + 1,
+        selector: e.selector,
+        label: e.label,
+        rect: {
+          left: round2(r.left),
+          top: round2(r.top),
+          width: round2(r.width),
+          height: round2(r.height)
+        },
+        blockReason: chain.blockReason,
+        clippers: chain.clippers
+      });
+    }
+    return auditFocusClip(nodes, { viewport: viewport });
+  }
+
   /* ---------------- 控件名称审计（DOM，组合树） ---------------- */
 
   // 审计范围：仅 button、a[href]、input[type=text]（CSS 选择器字面语义）
@@ -1972,6 +2255,7 @@
           modalAudit: computeModalAudit(),
           visualAudit: computeVisualAudit(),
           nameAudit: computeNameAudit(),
+          focusClipAudit: computeFocusClipAudit(),
           stats: {
             candidates: entries.length,
             ordered: order.length,

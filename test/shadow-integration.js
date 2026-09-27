@@ -224,4 +224,4 @@ setTimeout(() => {
     if (failures) { console.error('\n集成验证存在 ' + failures + ' 个失败'); process.exit(1); }
     console.log('\n集成验证全部通过');
   })();
-}, 400);
+}, 2000); // jsdom 的 getComputedStyle 很慢且进程间波动大，留足等待余量（真实浏览器为毫秒级）

@@ -60,6 +60,7 @@
         <button class="tab" id="tab-excluded" role="tab" aria-selected="false" type="button">排除与诊断 <span id="excluded-count" class="count">0</span></button>
         <button class="tab" id="tab-modal" role="tab" aria-selected="false" type="button">模态审计 <span id="modal-count" class="count">0</span></button>
         <button class="tab" id="tab-visual" role="tab" aria-selected="false" type="button">视觉顺序 <span id="visual-count" class="count">0</span></button>
+        <button class="tab" id="tab-clip" role="tab" aria-selected="false" type="button" title="焦点裁剪审计：Tab 节点矩形被 iframe 视口与组合祖先 overflow 裁剪的比例（仅矩形裁剪，不检测其他元素遮挡）">焦点裁剪 <span id="clip-count" class="count">0</span></button>
         <button class="tab" id="tab-name" role="tab" aria-selected="false" type="button" title="控件名称审计（button / a[href] / input[type=text]）">名称审计 <span id="name-count" class="count">0</span></button>
         <button class="tab" id="tab-baseline" role="tab" aria-selected="false" type="button">基线对比 <span id="baseline-count" class="count">0</span></button>
       </div>
@@ -87,6 +88,11 @@
         <h3>无法判定（不计作无偏差）</h3>
         <ul id="visual-undetermined-list" class="visual-list"></ul>
         <p id="visual-hint" class="diff-hint" role="status"></p>
+      </div>
+      <div id="clip-panel" class="clip-panel" hidden>
+        <p id="clip-meta" class="clip-meta"></p>
+        <ul id="clip-list" class="clip-list"></ul>
+        <p id="clip-hint" class="diff-hint" role="status"></p>
       </div>
       <div id="name-panel" class="name-panel" hidden>
         <p id="name-meta" class="name-meta"></p>
