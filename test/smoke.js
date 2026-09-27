@@ -27,6 +27,7 @@ async function check(name, fn) {
     if (!body.includes('模态审计')) throw new Error('缺少模态审计标签页');
     if (!body.includes('视觉顺序')) throw new Error('缺少视觉顺序审计标签页');
     if (!body.includes('名称审计')) throw new Error('缺少控件名称审计标签页');
+    if (!body.includes('焦点裁剪')) throw new Error('缺少焦点裁剪审计标签页');
   });
 
   await check('GET /analyzer.js 可加载', async () => {
@@ -37,6 +38,7 @@ async function check(name, fn) {
     if (!body.includes('computeModalCycle')) throw new Error('缺少模态审计逻辑');
     if (!body.includes('auditVisualOrder')) throw new Error('缺少视觉顺序审计逻辑');
     if (!body.includes('computeNameAudit')) throw new Error('缺少控件名称审计逻辑');
+    if (!body.includes('auditClip')) throw new Error('缺少焦点裁剪审计逻辑');
     if (!body.includes('buildShadowDiagnostics')) throw new Error('缺少 Shadow DOM 诊断逻辑');
     if (!body.includes('assignedElements')) throw new Error('缺少 slot 组合树展开');
     if (!body.includes('shadow-closed-undetermined')) throw new Error('缺少 closed 根不可检查标记');
@@ -65,6 +67,14 @@ async function check(name, fn) {
     const body = await res.text();
     if (!body.includes('renderNameAudit')) throw new Error('缺少名称审计渲染');
     if (!body.includes('nameAudit')) throw new Error('导出报告缺少 nameAudit 字段');
+  });
+
+  await check('GET /app.js 接线焦点裁剪审计（渲染 + 导出 clipAudit）', async () => {
+    const res = await fetch(BASE + '/app.js');
+    if (!res.ok) throw new Error('status ' + res.status);
+    const body = await res.text();
+    if (!body.includes('renderClipAudit')) throw new Error('缺少焦点裁剪审计渲染');
+    if (!body.includes('clipAudit')) throw new Error('导出报告缺少 clipAudit 字段');
   });
 
   await check('GET /api/health', async () => {
